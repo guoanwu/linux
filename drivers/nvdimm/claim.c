@@ -299,7 +299,7 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
 			rc = ret;
 	} else {
 		rc = ret;
-		pmem_wmb();
+		wmb();
 	}
 
 	return rc;

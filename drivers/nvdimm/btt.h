@@ -9,6 +9,7 @@
 
 #include <linux/badblocks.h>
 #include <linux/types.h>
+#include "nd.h"
 
 #define BTT_SIG_LEN 16
 #define BTT_SIG "BTT_ARENA_INFO\0"
@@ -186,6 +187,20 @@ struct arena_info {
 	u64 info2off;
 	/* Pointers to other in-memory structures for this arena */
 	struct free_entry *freelist;
+
+	/*divide the whole arena into #lanes zone. */
+	struct zone_free {
+		u32 free_num;
+		u32 *free_array;
+	} freezone_array;
+	struct aligned_lock list_lock;
+
+	/*
+	 * each lane, keep at least one free ABA
+	 * if in the lane, no ABA, get one from freelist
+	 */
+	u32 lane_free[BTT_DEFAULT_NFREE];
+
 	u32 *rtt;
 	struct aligned_lock *map_locks;
 	struct nd_btt *nd_btt;
