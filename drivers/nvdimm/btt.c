@@ -70,10 +70,6 @@ static int btt_info_write(struct arena_info *arena, struct btt_sb *super)
 	dev_WARN_ONCE(to_dev(arena), !IS_ALIGNED(arena->info2off, 512),
 		"arena->info2off: %#llx is unaligned\n", arena->info2off);
 
-	/*
-	 * btt_sb is critial information and need proper write
-	 * nvdimm_flush will be called (deepflush)
-	 */
 	ret = arena_write_bytes(arena, arena->info2off, super,
 			sizeof(struct btt_sb), 0);
 	if (ret)
@@ -194,6 +190,8 @@ static int btt_map_read(struct arena_info *arena, u32 lba, u32 *mapping,
 		break;
 	case 3:
 		*mapping = postmap;
+		z_flag = 1;
+		e_flag = 1;
 		break;
 	default:
 		return -EIO;
@@ -507,6 +505,30 @@ static u64 to_namespace_offset(struct arena_info *arena, u64 lba)
 	return arena->dataoff + ((u64)lba * arena->internal_lbasize);
 }
 
+static int arena_clear_error(struct arena_info *arena, u32 lba)
+{
+	int ret = 0;
+
+	void *zero_page = page_address(ZERO_PAGE(0));
+	u64 nsoff = to_namespace_offset(arena, lba);
+	unsigned long len = arena->sector_size;
+
+	mutex_lock(&arena->err_lock);
+	while (len) {
+		unsigned long chunk = min(len, PAGE_SIZE);
+
+		ret = arena_write_bytes(arena, nsoff, zero_page,
+			chunk, 0);
+		if (ret)
+			break;
+		len -= chunk;
+		nsoff += chunk;
+	}
+	mutex_unlock(&arena->err_lock);
+
+	return ret;
+}
+
 static int arena_clear_freelist_error(struct arena_info *arena, u32 lane)
 {
 	int ret = 0;
@@ -533,6 +555,82 @@ static int arena_clear_freelist_error(struct arena_info *arena, u32 lane)
 		}
 		mutex_unlock(&arena->err_lock);
 	}
+	return ret;
+}
+
+/*
+ * get_aba_in_a_lane - get a free block out of the freelist.
+ * @arena: arena handler
+ * @lane:	the block (postmap) will be put back to free array list
+ */
+static inline void get_lane_aba(struct arena_info *arena,
+		u32 lane, u32 *entry)
+{
+	uint32_t free_num;
+
+	spin_lock(&(arena->list_lock.lock));
+	free_num = arena->freezone_array.free_num;
+	arena->lane_free[lane] = arena->freezone_array.free_array[free_num - 1];
+	arena->freezone_array.free_num = free_num - 1;
+	spin_unlock(&(arena->list_lock.lock));
+
+	*entry = arena->lane_free[lane];
+}
+
+static int btt_freezone_init(struct arena_info *arena)
+{
+	int ret = 0, trim, err;
+	u32 i;
+	u32 mapping;
+	u8 *aba_map_byte, *aba_map;
+	u32 *free_array;
+	u32 free_num = 0;
+	u32 aba_map_size = (arena->internal_nlba>>3) + 1;
+
+	aba_map = vzalloc(aba_map_size);
+	if (!aba_map)
+		return -ENOMEM;
+
+	/*
+	 * prepare the aba_map, each aba will be in a bit, occupied bit=1, free bit=0
+	 * the scan will take times, but it is only once execution during initialization.
+	 */
+	for (i = 0; i < arena->external_nlba; i++) {
+		ret = btt_map_read(arena, i, &mapping, &trim, &err, 0);
+		if (ret || (trim == 0 && err == 0))
+			continue;
+		if (mapping < arena->internal_nlba) {
+			aba_map_byte = aba_map + (mapping>>3);
+			*aba_map_byte |= (u8)(1<<(mapping % 8));
+		}
+	}
+
+	/*
+	 * Scan the aba_bitmap , use the static array, that will take 1% memory.
+	 */
+	free_array = vmalloc(arena->internal_nlba*sizeof(u32));
+	if (!free_array) {
+		vfree(aba_map);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < arena->internal_nlba; i++) {
+		aba_map_byte = aba_map + (i>>3);
+		if (((*aba_map_byte) & (1<<(i%8))) == 0) {
+			free_array[free_num] = i;
+			free_num++;
+		}
+	}
+	spin_lock_init(&(arena->list_lock.lock));
+
+	for (i = 0; i < arena->nfree; i++) {
+		arena->lane_free[i] = free_array[free_num - 1];
+		free_num--;
+	}
+	arena->freezone_array.free_array = free_array;
+	arena->freezone_array.free_num = free_num;
+
+	vfree(aba_map);
 	return ret;
 }
 
@@ -597,8 +695,7 @@ static int btt_freelist_init(struct arena_info *arena)
 			 * to complete the map write. So fix up the map.
 			 */
 			ret = btt_map_write(arena, le32_to_cpu(log_new.lba),
-					le32_to_cpu(log_new.new_map), 0, 0,
-					NVDIMM_NO_DEEPFLUSH);
+					le32_to_cpu(log_new.new_map), 0, 0, NVDIMM_NO_DEEPFLUSH);
 			if (ret)
 				return ret;
 		}
@@ -813,7 +910,12 @@ static void free_arenas(struct btt *btt)
 		list_del(&arena->list);
 		kfree(arena->rtt);
 		kfree(arena->map_locks);
-		kfree(arena->freelist);
+		if (arena->version_major == 2) {
+			if (arena->freezone_array.free_array)
+				vfree(arena->freezone_array.free_array);
+		} else {
+			kfree(arena->freelist);
+		}
 		debugfs_remove_recursive(arena->debugfs_dir);
 		kfree(arena);
 	}
@@ -892,14 +994,18 @@ static int discover_arenas(struct btt *btt)
 		arena->external_lba_start = cur_nlba;
 		parse_arena_meta(arena, super, cur_off);
 
-		ret = log_set_indices(arena);
-		if (ret) {
-			dev_err(to_dev(arena),
-				"Unable to deduce log/padding indices\n");
-			goto out;
-		}
+		if (arena->version_major == 2) {
+			ret = btt_freezone_init(arena);
+		} else {
+			ret = log_set_indices(arena);
+			if (ret) {
+				dev_err(to_dev(arena),
+					"Unable to deduce log/padding indices\n");
+				goto out;
+			}
 
-		ret = btt_freelist_init(arena);
+			ret = btt_freelist_init(arena);
+		}
 		if (ret)
 			goto out;
 
@@ -984,9 +1090,11 @@ static int btt_arena_write_layout(struct arena_info *arena)
 	if (ret)
 		return ret;
 
-	ret = btt_log_init(arena);
-	if (ret)
-		return ret;
+	if (arena->version_major != 2) {
+		ret = btt_log_init(arena);
+		if (ret)
+			return ret;
+	}
 
 	super = kzalloc(sizeof(struct btt_sb), GFP_NOIO);
 	if (!super)
@@ -1039,7 +1147,10 @@ static int btt_meta_init(struct btt *btt)
 		if (ret)
 			goto unlock;
 
-		ret = btt_freelist_init(arena);
+		if (arena->version_major == 2)
+			ret = btt_freezone_init(arena);
+		else
+			ret = btt_freelist_init(arena);
 		if (ret)
 			goto unlock;
 
@@ -1233,12 +1344,14 @@ static int btt_read_pg(struct btt *btt, struct bio_integrity_payload *bip,
 			u32 new_map;
 			int new_t, new_e;
 
-			if (t_flag) {
+			/* t_flag = 1, e_flag = 0 or t_flag=0, e_flag=0 */
+			if ((t_flag && e_flag == 0) || (t_flag == 0 && e_flag == 0)) {
 				zero_fill_data(page, off, cur_len);
 				goto out_lane;
 			}
 
-			if (e_flag) {
+			/* t_flag = 0, e_flag = 1*/
+			if (e_flag && t_flag == 0) {
 				ret = -EIO;
 				goto out_lane;
 			}
@@ -1326,6 +1439,7 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 	while (len) {
 		u32 cur_len;
 		int e_flag;
+		int z_flag;
 
  retry:
 		lane = nd_region_acquire_lane(btt->nd_region);
@@ -1340,28 +1454,40 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 			goto out_lane;
 		}
 
-		if (btt_is_badblock(btt, arena, arena->freelist[lane].block))
-			arena->freelist[lane].has_err = 1;
+		if (arena->version_major == 2) {
+			new_postmap = arena->lane_free[lane];
+			if (btt_is_badblock(btt, arena, new_postmap)
+				|| mutex_is_locked(&arena->err_lock)) {
+				nd_region_release_lane(btt->nd_region, lane);
+				ret = arena_clear_error(arena, new_postmap);
+				if (ret)
+					return ret;
+				/* OK to acquire a different lane/free block */
+				goto retry;
+			}
+		} else {
+			if (btt_is_badblock(btt, arena, arena->freelist[lane].block))
+				arena->freelist[lane].has_err = 1;
 
-		if (mutex_is_locked(&arena->err_lock)
-				|| arena->freelist[lane].has_err) {
-			nd_region_release_lane(btt->nd_region, lane);
+			if (mutex_is_locked(&arena->err_lock)
+					|| arena->freelist[lane].has_err) {
+				nd_region_release_lane(btt->nd_region, lane);
 
-			ret = arena_clear_freelist_error(arena, lane);
-			if (ret)
-				return ret;
+				ret = arena_clear_freelist_error(arena, lane);
+				if (ret)
+					return ret;
 
-			/* OK to acquire a different lane/free block */
-			goto retry;
+				/* OK to acquire a different lane/free block */
+				goto retry;
+			}
+
+			new_postmap = arena->freelist[lane].block;
 		}
-
-		new_postmap = arena->freelist[lane].block;
 
 		/* Wait if the new block is being read from */
 		for (i = 0; i < arena->nfree; i++)
 			while (arena->rtt[i] == (RTT_VALID | new_postmap))
 				cpu_relax();
-
 
 		if (new_postmap >= arena->internal_nlba) {
 			ret = -EIO;
@@ -1380,7 +1506,7 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 		}
 
 		lock_map(arena, premap);
-		ret = btt_map_read(arena, premap, &old_postmap, NULL, &e_flag,
+		ret = btt_map_read(arena, premap, &old_postmap, &z_flag, &e_flag,
 				NVDIMM_IO_ATOMIC);
 		if (ret)
 			goto out_map;
@@ -1388,17 +1514,25 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 			ret = -EIO;
 			goto out_map;
 		}
-		if (e_flag)
-			set_e_flag(old_postmap);
 
-		log.lba = cpu_to_le32(premap);
-		log.old_map = cpu_to_le32(old_postmap);
-		log.new_map = cpu_to_le32(new_postmap);
-		log.seq = cpu_to_le32(arena->freelist[lane].seq);
-		sub = arena->freelist[lane].sub;
-		ret = btt_flog_write(arena, lane, sub, &log);
-		if (ret)
-			goto out_map;
+		if (arena->version_major == 2) {
+			if (z_flag == 0 && e_flag == 0) /* initialization state (00)*/
+				get_lane_aba(arena, lane, &old_postmap);
+			else
+				arena->lane_free[lane] = old_postmap;
+		} else {
+			if (e_flag && z_flag != 1) /* Error State (10) */
+				set_e_flag(old_postmap);
+
+			log.lba = cpu_to_le32(premap);
+			log.old_map = cpu_to_le32(old_postmap);
+			log.new_map = cpu_to_le32(new_postmap);
+			log.seq = cpu_to_le32(arena->freelist[lane].seq);
+			sub = arena->freelist[lane].sub;
+			ret = btt_flog_write(arena, lane, sub, &log);
+			if (ret)
+				goto out_map;
+		}
 
 		ret = btt_map_write(arena, premap, new_postmap, 0, 0,
 			NVDIMM_IO_ATOMIC|NVDIMM_NO_DEEPFLUSH);
@@ -1408,8 +1542,11 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 		unlock_map(arena, premap);
 		nd_region_release_lane(btt->nd_region, lane);
 
-		if (e_flag) {
-			ret = arena_clear_freelist_error(arena, lane);
+		if (e_flag && z_flag != 1) {
+			if (arena->version_major == 2)
+				ret = arena_clear_error(arena, old_postmap);
+			else
+				ret = arena_clear_freelist_error(arena, lane);
 			if (ret)
 				return ret;
 		}
