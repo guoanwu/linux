@@ -70,6 +70,10 @@ static int btt_info_write(struct arena_info *arena, struct btt_sb *super)
 	dev_WARN_ONCE(to_dev(arena), !IS_ALIGNED(arena->info2off, 512),
 		"arena->info2off: %#llx is unaligned\n", arena->info2off);
 
+	/*
+	 * btt_sb is critial information and need proper write
+	 * nvdimm_flush will be called (deepflush)
+	 */
 	ret = arena_write_bytes(arena, arena->info2off, super,
 			sizeof(struct btt_sb), 0);
 	if (ret)
@@ -384,7 +388,8 @@ static int btt_flog_write(struct arena_info *arena, u32 lane, u32 sub,
 {
 	int ret;
 
-	ret = __btt_log_write(arena, lane, sub, ent, NVDIMM_IO_ATOMIC);
+	ret = __btt_log_write(arena, lane, sub, ent,
+		NVDIMM_IO_ATOMIC|NVDIMM_NO_DEEPFLUSH);
 	if (ret)
 		return ret;
 
@@ -429,7 +434,7 @@ static int btt_map_init(struct arena_info *arena)
 		dev_WARN_ONCE(to_dev(arena), size < 512,
 			"chunk size: %#zx is unaligned\n", size);
 		ret = arena_write_bytes(arena, arena->mapoff + offset, zerobuf,
-				size, 0);
+				size, NVDIMM_NO_DEEPFLUSH);
 		if (ret)
 			goto free;
 
@@ -473,7 +478,7 @@ static int btt_log_init(struct arena_info *arena)
 		dev_WARN_ONCE(to_dev(arena), size < 512,
 			"chunk size: %#zx is unaligned\n", size);
 		ret = arena_write_bytes(arena, arena->logoff + offset, zerobuf,
-				size, 0);
+				size, NVDIMM_NO_DEEPFLUSH);
 		if (ret)
 			goto free;
 
@@ -487,7 +492,7 @@ static int btt_log_init(struct arena_info *arena)
 		ent.old_map = cpu_to_le32(arena->external_nlba + i);
 		ent.new_map = cpu_to_le32(arena->external_nlba + i);
 		ent.seq = cpu_to_le32(LOG_SEQ_INIT);
-		ret = __btt_log_write(arena, i, 0, &ent, 0);
+		ret = __btt_log_write(arena, i, 0, &ent, NVDIMM_NO_DEEPFLUSH);
 		if (ret)
 			goto free;
 	}
@@ -518,7 +523,7 @@ static int arena_clear_freelist_error(struct arena_info *arena, u32 lane)
 			unsigned long chunk = min(len, PAGE_SIZE);
 
 			ret = arena_write_bytes(arena, nsoff, zero_page,
-				chunk, 0);
+				chunk, NVDIMM_NO_DEEPFLUSH);
 			if (ret)
 				break;
 			len -= chunk;
@@ -592,7 +597,8 @@ static int btt_freelist_init(struct arena_info *arena)
 			 * to complete the map write. So fix up the map.
 			 */
 			ret = btt_map_write(arena, le32_to_cpu(log_new.lba),
-					le32_to_cpu(log_new.new_map), 0, 0, 0);
+					le32_to_cpu(log_new.new_map), 0, 0,
+					NVDIMM_NO_DEEPFLUSH);
 			if (ret)
 				return ret;
 		}
@@ -1123,7 +1129,8 @@ static int btt_data_write(struct arena_info *arena, u32 lba,
 	u64 nsoff = to_namespace_offset(arena, lba);
 	void *mem = kmap_atomic(page);
 
-	ret = arena_write_bytes(arena, nsoff, mem + off, len, NVDIMM_IO_ATOMIC);
+	ret = arena_write_bytes(arena, nsoff, mem + off, len,
+		NVDIMM_IO_ATOMIC|NVDIMM_NO_DEEPFLUSH);
 	kunmap_atomic(mem);
 
 	return ret;
@@ -1264,8 +1271,11 @@ static int btt_read_pg(struct btt *btt, struct bio_integrity_payload *bip,
 			int rc;
 
 			/* Media error - set the e_flag */
-			rc = btt_map_write(arena, premap, postmap, 0, 1,
-				NVDIMM_IO_ATOMIC);
+			if (btt_map_write(arena, premap, postmap, 0, 1,
+				NVDIMM_IO_ATOMIC|NVDIMM_NO_DEEPFLUSH))
+				dev_warn_ratelimited(to_dev(arena),
+					"Error persistently tracking bad blocks at %#x\n",
+					premap);
 			goto out_rtt;
 		}
 
@@ -1395,7 +1405,7 @@ static int btt_write_pg(struct btt *btt, struct bio_integrity_payload *bip,
 			goto out_map;
 
 		ret = btt_map_write(arena, premap, new_postmap, 0, 0,
-			NVDIMM_IO_ATOMIC);
+			NVDIMM_IO_ATOMIC|NVDIMM_NO_DEEPFLUSH);
 		if (ret)
 			goto out_map;
 

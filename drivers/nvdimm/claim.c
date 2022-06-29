@@ -293,9 +293,14 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
 	}
 
 	memcpy_flushcache(nsio->addr + offset, buf, size);
-	ret = nvdimm_flush(to_nd_region(ndns->dev.parent), NULL);
-	if (ret)
+	if (!(flags & NVDIMM_NO_DEEPFLUSH)) {
+		ret = nvdimm_flush(to_nd_region(ndns->dev.parent), NULL);
+		if (ret)
+			rc = ret;
+	} else {
 		rc = ret;
+		pmem_wmb();
+	}
 
 	return rc;
 }
