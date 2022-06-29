@@ -22,7 +22,11 @@ enum {
 	 */
 	ND_MAX_LANES = 256,
 	INT_LBASIZE_ALIGNMENT = 64,
+	/*
+	 * NVDIMM_IO_ATOMIC | NVDIMM_NO_DEEPFLUSH is support.
+	 */
 	NVDIMM_IO_ATOMIC = 1,
+	NVDIMM_NO_DEEPFLUSH = 2,
 };
 
 struct nvdimm_drvdata {
