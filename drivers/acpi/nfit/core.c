@@ -52,6 +52,10 @@ static bool force_labels;
 module_param(force_labels, bool, 0444);
 MODULE_PARM_DESC(force_labels, "Opt-in to labels despite missing methods");
 
+static bool no_deepflush;
+module_param(no_deepflush, bool, 0644);
+MODULE_PARM_DESC(no_deepflush, "skip deep flush if ADR or no strict security");
+
 LIST_HEAD(acpi_descs);
 DEFINE_MUTEX(acpi_desc_lock);
 
@@ -981,8 +985,10 @@ static void *add_table(struct acpi_nfit_desc *acpi_desc,
 			return err;
 		break;
 	case ACPI_NFIT_TYPE_FLUSH_ADDRESS:
-		if (!add_flush(acpi_desc, prev, table))
-			return err;
+		if (!no_deepflush) {
+			if (!add_flush(acpi_desc, prev, table))
+				return err;
+		}
 		break;
 	case ACPI_NFIT_TYPE_SMBIOS:
 		dev_dbg(dev, "smbios\n");
