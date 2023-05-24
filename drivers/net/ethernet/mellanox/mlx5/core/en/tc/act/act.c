@@ -11,7 +11,7 @@ static struct mlx5e_tc_act *tc_acts_fdb[NUM_FLOW_ACTIONS] = {
 	[FLOW_ACTION_DROP] = &mlx5e_tc_act_drop,
 	[FLOW_ACTION_TRAP] = &mlx5e_tc_act_trap,
 	[FLOW_ACTION_GOTO] = &mlx5e_tc_act_goto,
-	[FLOW_ACTION_REDIRECT] = &mlx5e_tc_act_mirred,
+	[FLOW_ACTION_REDIRECT] = &mlx5e_tc_act_redirect,
 	[FLOW_ACTION_MIRRED] = &mlx5e_tc_act_mirred,
 	[FLOW_ACTION_REDIRECT_INGRESS] = &mlx5e_tc_act_redirect_ingress,
 	[FLOW_ACTION_VLAN_PUSH] = &mlx5e_tc_act_vlan,
@@ -80,26 +80,6 @@ mlx5e_tc_act_init_parse_state(struct mlx5e_tc_act_parse_state *parse_state,
 	parse_state->flow = flow;
 	parse_state->extack = extack;
 	parse_state->flow_action = flow_action;
-}
-
-void
-mlx5e_tc_act_reorder_flow_actions(struct flow_action *flow_action,
-				  struct mlx5e_tc_flow_action *flow_action_reorder)
-{
-	struct flow_action_entry *act;
-	int i, j = 0;
-
-	flow_action_for_each(i, act, flow_action) {
-		/* Add CT action to be first. */
-		if (act->id == FLOW_ACTION_CT)
-			flow_action_reorder->entries[j++] = act;
-	}
-
-	flow_action_for_each(i, act, flow_action) {
-		if (act->id == FLOW_ACTION_CT)
-			continue;
-		flow_action_reorder->entries[j++] = act;
-	}
 }
 
 int
